@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GLIDE Simulation - Autonomous Hybrid</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', sans-serif; background: #1a1a1a; display: flex; justify-content: center; align-items: center; min-height: 100vh; color: white; }
+        .container { background: #2c3e50; padding: 20px; border-radius: 15px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+        canvas { background: #34495e; border: 4px solid #444; border-radius: 8px; display: block; }
+        .controls { display: flex; gap: 20px; margin-top: 15px; align-items: center; background: rgba(0,0,0,0.3); padding: 15px; border-radius: 8px; }
+        .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-top: 15px; }
+        .stat-box { background: #1a1a1a; padding: 10px; border-radius: 5px; text-align: center; border-bottom: 3px solid #f1c40f; }
+        .stat-label { font-size: 10px; color: #bdc3c7; text-transform: uppercase; display: block; margin-bottom: 5px; }
+        .stat-value { font-size: 18px; font-weight: bold; color: #f1c40f; display: block; }
+        button { padding: 10px 20px; cursor: pointer; border: none; border-radius: 4px; font-weight: bold; transition: 0.2s; }
+        .btn-start { background: #27ae60; color: white; }
+        .btn-reset { background: #e74c3c; color: white; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2 style="text-align: center; margin-bottom: 15px; letter-spacing: 2px;">GLIDE HYBRID (AUTONOMOUS RECOVERY)</h2>
+        
+        <canvas id="trafficCanvas" width="800" height="800"></canvas>
+        
+        <div class="controls">
+            <button class="btn-start" id="toggleBtn">START SIMULATION</button>
+            <button class="btn-reset" id="resetBtn">RESET</button>
+            <div style="flex-grow: 1">
+                <span style="font-size: 12px; display: block; margin-bottom: 5px;">FLOW DENSITY</span>
+                <input type="range" id="spawnControl" min="0.005" max="0.15" step="0.005" value="0.03" style="width: 100%">
+            </div>
+        </div>
+
+        <div class="stats">
+            <div class="stat-box"><span class="stat-label">Active Cars</span><span id="vCount" class="stat-value">0</span></div>
+            <div class="stat-box"><span class="stat-label">Cycle Time</span><span id="vCycle" class="stat-value">20s</span></div>
+            <div class="stat-box"><span class="stat-label">Congestion</span><span id="vCongestion" class="stat-value">0%</span></div>
+            <div class="stat-box"><span class="stat-label">Avg Wait</span><span id="vWait" class="stat-value">0.0s</span></div>
+        </div>
+    </div>
+
+<script>
+    const canvas = document.getElementById('trafficCanvas');
+    const ctx = canvas.getContext('2d');
+
+    const GRID_SIZE = 2; 
+    const ROAD_WIDTH = 80;
+    const LANE_OFFSET = 20; 
+    const CELL_SIZE = canvas.width / GRID_SIZE;
+    
+    const MIN_GREEN = 300; // FIX: Minimal 5 detik hijau untuk menjamin countdown merah yang cukup
+    const MAX_GREEN = 720; 
+    const YELLOW_TIME = 60; // 1 detik kuning
+    const MAX_SPEED = 3.2;  
+    const ACCEL = 0.08;     
+    const BRAKE_FORCE = 0.4; 
+    const REACTION_DIST = 110;
+
+    let state = {
+        running: false,
+        vehicles: [],
+        intersections: [],
+        spawnRate: 0.03,
+        totalWaitAccumulated: 0,
+        totalVehiclesProcessed: 0,
+        masterTimer: 0,
+        overflowCount: 0
+    };
+
+    function initIntersections() {
+        state.intersections = [];
+        state.overflowCount = 0;
+        state.masterTimer = 0;
+        for (let r = 0; r < GRID_SIZE; r++) {
+            for (let c = 0; c < GRID_SIZE; c++) {
+                state.intersections.push({
+                    x: (c + 0.5) * CELL_SIZE,
+                    y: (r + 0.5) * CELL_SIZE,
+                    localTimer: 0, 
+                    phase: 0, 
+                    durations: [360, 60, 360, 60, 360, 60, 360, 60],
+                    occ: [0, 0, 0, 0], 
+                    qBlocked: [false, false, false, false],
+                    qHistory: [false, false, false, false], 
+                    lockedNextPhase: 2, 
+                    baseOffset: (r + c) * 60,
+                    quietCycles: 0,
+                    id: r * GRID_SIZE + c
+                });
+            }
+        }
+    }
+
+    function applyGlideLogic(inter) {
+        let intersectionIsQuiet = true;
+        for(let i=0; i<4; i++) {
+            let ds = inter.occ[i] / Math.max(1, inter.durations[i*2]);
+            if (ds > 0.75 || inter.qHistory[i]) {
+                inter.durations[i*2] = Math.min(MAX_GREEN, inter.durations[i*2] + 60); 
+                intersectionIsQuiet = false;
+            } else if (ds < 0.25 && inter.durations[i*2] > MIN_GREEN) {
+                inter.durations[i*2] -= 60; 
+            }
+            if (ds > 0.3) intersectionIsQuiet = false;
+        }
+        
+        if (intersectionIsQuiet) inter.quietCycles++;
+        else inter.quietCycles = 0;
+
+        if (inter.quietCycles > 1) {
+            const cycleTotal = inter.durations.reduce((a,b)=>a+b, 0);
+            const masterPos = (state.masterTimer + inter.baseOffset) % cycleTotal;
+            if (masterPos > 10 && masterPos < cycleTotal - 10) {
+                inter.localTimer += 10; 
+            }
+        }
+        inter.qHistory = [false, false, false, false];
+    }
+
+    function spawn() {
+        if (Math.random() > state.spawnRate) return;
+        const dir = ['N', 'S', 'E', 'W'][Math.floor(Math.random() * 4)];
+        const roadPos = (Math.floor(Math.random() * GRID_SIZE) + 0.5) * CELL_SIZE;
+        let v = {
+            id: Math.random(), dir: dir,
+            maxSpeed: MAX_SPEED * (0.8 + Math.random() * 0.4),
+            personalAccel: ACCEL * (0.7 + Math.random() * 0.6),
+            driverFocus: 0.5 + Math.random() * 1.5,
+            currentSpeed: 0, x: 0, y: 0, lastInterId: -1, reactionDelay: 0 
+        };
+        if (dir === 'S') { v.x = roadPos - LANE_OFFSET; v.y = -40; }
+        if (dir === 'N') { v.x = roadPos + LANE_OFFSET; v.y = canvas.height + 40; }
+        if (dir === 'E') { v.x = -40; v.y = roadPos + LANE_OFFSET; }
+        if (dir === 'W') { v.x = canvas.width + 40; v.y = roadPos - LANE_OFFSET; }
+        if (!state.vehicles.some(other => Math.hypot(v.x - other.x, v.y - other.y) < 60)) {
+            state.vehicles.push(v);
+            state.totalVehiclesProcessed++;
+        }
+    }
+
+    function update() {
+        if (!state.running) return;
+        spawn();
+        state.masterTimer++;
+
+        state.intersections.forEach(inter => {
+            inter.localTimer++;
+
+            let priorityCall = -1;
+            for(let i=0; i<4; i++) {
+                if (inter.qBlocked[i] && inter.phase !== i*2 && inter.phase !== i*2+1) {
+                    priorityCall = i*2; 
+                    inter.qHistory[i] = true;
+                    break; 
+                }
+            }
+            inter.lockedNextPhase = (priorityCall !== -1) ? priorityCall : (Math.floor(inter.phase / 2) * 2 + 2) % 8;
+
+            // EMERGENCY TRUNCATION FIX: Sediakan minimal 5 detik sisa hijau agar countdown tetap panjang
+            if (priorityCall !== -1 && inter.phase % 2 === 0) {
+                let timeRemaining = inter.durations[inter.phase] - inter.localTimer;
+                if (timeRemaining > 300) { 
+                    inter.durations[inter.phase] = inter.localTimer + 300; 
+                    state.overflowCount++;
+                }
+            }
+            
+            if (inter.localTimer >= inter.durations[inter.phase]) {
+                let oldPhase = inter.phase;
+                inter.localTimer = 0;
+                
+                if (oldPhase === 7) applyGlideLogic(inter); 
+
+                if (oldPhase % 2 === 0) { 
+                    inter.phase = oldPhase + 1;
+                } else { 
+                    inter.phase = inter.lockedNextPhase;
+                }
+                
+                if (inter.phase % 2 === 0) inter.occ[inter.phase/2] = 0;
+            }
+
+            inter.qBlocked = [false, false, false, false];
+            state.vehicles.forEach(v => {
+                const sFar = 125, sNear = 75; 
+                const qFar = 300, qNear = 250; 
+                let sIdx = -1;
+                if (v.dir === 'S' && Math.abs(v.x - (inter.x - LANE_OFFSET)) < 15) {
+                    if (v.y > inter.y - sFar && v.y < inter.y - sNear) sIdx = 0;
+                    if (v.y > inter.y - qFar && v.y < inter.y - qNear) inter.qBlocked[0] = true;
+                }
+                if (v.dir === 'N' && Math.abs(v.x - (inter.x + LANE_OFFSET)) < 15) {
+                    if (v.y > inter.y + sNear && v.y < inter.y + sFar) sIdx = 1;
+                    if (v.y > inter.y + qNear && v.y < inter.y + qFar) inter.qBlocked[1] = true;
+                }
+                if (v.dir === 'E' && Math.abs(v.y - (inter.y + LANE_OFFSET)) < 15) {
+                    if (v.x > inter.x - sFar && v.x < inter.x - sNear) sIdx = 2;
+                    if (v.x > inter.x - qFar && v.x < inter.x - qNear) inter.qBlocked[2] = true;
+                }
+                if (v.dir === 'W' && Math.abs(v.y - (inter.y - LANE_OFFSET)) < 15) {
+                    if (v.x > inter.x + sNear && v.x < inter.x + sFar) sIdx = 3;
+                    if (v.x > inter.x + qNear && v.x < inter.x + qFar) inter.qBlocked[3] = true;
+                }
+                if (sIdx !== -1 && inter.phase === sIdx * 2) inter.occ[sIdx]++;
+            });
+        });
+
+        state.vehicles.forEach(v => {
+            let targetSpeed = v.maxSpeed;
+            state.intersections.forEach(inter => {
+                const dist = Math.hypot(inter.x - v.x, inter.y - v.y);
+                let light = 'RED';
+                const p = inter.phase;
+                if (v.dir === 'S' && v.y < inter.y) { if (p === 0) light = 'GREEN'; else if (p === 1) light = 'YELLOW'; }
+                else if (v.dir === 'N' && v.y > inter.y) { if (p === 2) light = 'GREEN'; else if (p === 3) light = 'YELLOW'; }
+                else if (v.dir === 'E' && v.x < inter.x) { if (p === 4) light = 'GREEN'; else if (p === 5) light = 'YELLOW'; }
+                else if (v.dir === 'W' && v.x > inter.x) { if (p === 6) light = 'GREEN'; else if (p === 7) light = 'YELLOW'; }
+                const apprx = (v.dir === 'S' && v.y < inter.y - 40) || (v.dir === 'N' && v.y > inter.y + 40) ||
+                                (v.dir === 'E' && v.x < inter.x - 40) || (v.dir === 'W' && v.x > inter.x + 40);
+                if (apprx && dist < REACTION_DIST) {
+                    if (light === 'RED') targetSpeed = 0;
+                    else if (light === 'YELLOW' && dist > 60) targetSpeed = 0;
+                    else if (light === 'GREEN' && dist < 65) { 
+                        let exitX = v.x, exitY = v.y;
+                        if (v.dir === 'S') exitY = inter.y + 60; else if (v.dir === 'N') exitY = inter.y - 60;
+                        else if (v.dir === 'E') exitX = inter.x + 60; else exitX = inter.x - 60;
+                        const exitStalled = state.vehicles.some(other => 
+                            other.id !== v.id && Math.hypot(other.x - exitX, other.y - exitY) < 40 && other.currentSpeed < 0.2
+                        );
+                        if (exitStalled) targetSpeed = 0;
+                    }
+                }
+
+                if (dist < 25 && v.lastInterId !== inter.id && (light === 'GREEN' || light === 'YELLOW')) {
+                    v.lastInterId = inter.id;
+                    if (Math.random() < 0.5) { 
+                        const choices = (v.dir === 'N' || v.dir === 'S') ? ['E','W'] : ['N','S'];
+                        v.dir = choices[Math.floor(Math.random() * 2)];
+                        if (v.dir === 'S' || v.dir === 'N') v.x = (v.dir === 'S') ? inter.x - LANE_OFFSET : inter.x + LANE_OFFSET;
+                        if (v.dir === 'E' || v.dir === 'W') v.y = (v.dir === 'E') ? inter.y + LANE_OFFSET : inter.y - LANE_OFFSET;
+                    }
+                }
+            });
+            state.vehicles.forEach(other => {
+                if (v.id === other.id) return;
+                const gap = Math.hypot(other.x - v.x, other.y - v.y);
+                let inFront = (v.dir === 'S' && Math.abs(other.x-v.x) < 12 && other.y > v.y) || 
+                               (v.dir === 'N' && Math.abs(other.x-v.x) < 12 && other.y < v.y) ||
+                               (v.dir === 'E' && Math.abs(other.y-v.y) < 12 && other.x > v.x) || 
+                               (v.dir === 'W' && Math.abs(other.y-v.y) < 12 && other.x < v.x);
+                if (inFront && gap < 70) {
+                    targetSpeed = Math.min(targetSpeed, other.currentSpeed * 0.9);
+                    if (gap < 45) targetSpeed = 0;
+                }
+                if (!inFront && gap < 25 && v.currentSpeed > other.currentSpeed) targetSpeed = 0;
+            });
+            if (targetSpeed > 0 && v.currentSpeed < 0.1 && v.reactionDelay === 0) {
+                v.reactionDelay = (Math.random() * 10 + 2) * v.driverFocus; 
+            }
+            if (v.reactionDelay > 0) { v.reactionDelay--; targetSpeed = 0; }
+            v.currentSpeed += (v.currentSpeed < targetSpeed) ? v.personalAccel : -BRAKE_FORCE;
+            v.currentSpeed = Math.max(0, v.currentSpeed);
+            if (v.currentSpeed < 0.1) state.totalWaitAccumulated += (1/60);
+            if (v.dir === 'S') v.y += v.currentSpeed; else if (v.dir === 'N') v.y -= v.currentSpeed;
+            else if (v.dir === 'E') v.x += v.currentSpeed; else v.x -= v.currentSpeed;
+        });
+        state.vehicles = state.vehicles.filter(v => v.x > -100 && v.x < canvas.width + 100 && v.y > -100 && v.y < canvas.height + 100);
+        updateUI();
+    }
+
+    function draw() {
+        ctx.fillStyle = '#27ae60'; ctx.fillRect(0,0,canvas.width,canvas.height);
+        for (let i = 0; i < GRID_SIZE; i++) {
+            const pos = (i + 0.5) * CELL_SIZE;
+            ctx.fillStyle = '#2c3e50';
+            ctx.fillRect(pos - ROAD_WIDTH/2, 0, ROAD_WIDTH, canvas.height); 
+            ctx.fillRect(0, pos - ROAD_WIDTH/2, canvas.width, ROAD_WIDTH); 
+            ctx.strokeStyle = '#f1c40f'; ctx.lineWidth = 1; ctx.setLineDash([15, 10]);
+            ctx.beginPath(); ctx.moveTo(pos, 0); ctx.lineTo(pos, canvas.height); ctx.stroke();
+            ctx.beginPath(); ctx.moveTo(0, pos); ctx.lineTo(canvas.width, pos); ctx.stroke();
+            ctx.setLineDash([]);
+        }
+
+        state.intersections.forEach(inter => {
+            ctx.fillStyle = '#34495e'; ctx.fillRect(inter.x - ROAD_WIDTH/2, inter.y - ROAD_WIDTH/2, ROAD_WIDTH, ROAD_WIDTH);
+            ctx.strokeStyle = "rgba(46, 204, 113, 0.4)"; ctx.lineWidth = 2;
+            ctx.strokeRect(inter.x - LANE_OFFSET - 10, inter.y - 125, 20, 50); 
+            ctx.strokeRect(inter.x + LANE_OFFSET - 10, inter.y + 75, 20, 50);  
+            ctx.strokeRect(inter.x - 125, inter.y + LANE_OFFSET - 10, 50, 20); 
+            ctx.strokeRect(inter.x + 75, inter.y - LANE_OFFSET - 10, 50, 20);  
+            ctx.strokeStyle = "rgba(231, 76, 60, 0.6)"; 
+            ctx.strokeRect(inter.x - LANE_OFFSET - 10, inter.y - 300, 20, 50); 
+            ctx.strokeRect(inter.x + LANE_OFFSET - 10, inter.y + 250, 20, 50);  
+            ctx.strokeRect(inter.x - 300, inter.y + LANE_OFFSET - 10, 50, 20); 
+            ctx.strokeRect(inter.x + 250, inter.y - LANE_OFFSET - 10, 50, 20);  
+
+            const drawLaneLamp = (lx, ly, actPh) => {
+                let color = '#e74c3c'; let rem = 0; let showTimer = false;
+                if (inter.phase === actPh) { color = '#2ecc71'; rem = inter.durations[actPh] - inter.localTimer + inter.durations[actPh+1]; showTimer = true; } 
+                else if (inter.phase === actPh + 1) { color = '#f1c40f'; rem = inter.durations[actPh+1] - inter.localTimer; showTimer = true; } 
+                else if (actPh === inter.lockedNextPhase) {
+                    color = '#e74c3c';
+                    rem = inter.durations[inter.phase] - inter.localTimer;
+                    if (inter.phase % 2 === 0) rem += inter.durations[inter.phase + 1];
+                    showTimer = true;
+                }
+                ctx.fillStyle = '#000'; ctx.beginPath(); ctx.arc(lx, ly, 10, 0, 7); ctx.fill();
+                ctx.fillStyle = color; ctx.beginPath(); ctx.arc(lx, ly, 8, 0, 7); ctx.fill();
+                if (showTimer) {
+                    ctx.font = "bold 11px Courier"; ctx.textAlign = "center";
+                    ctx.fillText(Math.max(1, Math.ceil(rem / 60)), lx, ly > inter.y ? ly + 25 : ly - 15);
+                }
+            };
+            const edge = ROAD_WIDTH/2;
+            drawLaneLamp(inter.x - LANE_OFFSET, inter.y - edge - 10, 0); 
+            drawLaneLamp(inter.x + LANE_OFFSET, inter.y + edge + 10, 2); 
+            drawLaneLamp(inter.x - edge - 10, inter.y + LANE_OFFSET, 4); 
+            drawLaneLamp(inter.x + edge + 10, inter.y - LANE_OFFSET, 6); 
+        });
+
+        state.vehicles.forEach(v => {
+            ctx.save(); ctx.translate(v.x, v.y);
+            if (v.dir === 'E') ctx.rotate(Math.PI/2); else if (v.dir === 'W') ctx.rotate(-Math.PI/2); else if (v.dir === 'N') ctx.rotate(Math.PI);
+            ctx.fillStyle = '#f1c40f'; ctx.fillRect(-8, -12, 16, 24);
+            ctx.restore();
+        });
+        if (state.running) update();
+        requestAnimationFrame(draw);
+    }
+
+    function updateUI() {
+        document.getElementById('vCount').textContent = state.vehicles.length;
+        const avgCycle = state.intersections[0].durations.reduce((a,b)=>a+b,0)/60;
+        document.getElementById('vCycle').textContent = avgCycle.toFixed(0) + "s";
+        const avgS = state.vehicles.length > 0 ? (state.vehicles.reduce((a,b) => a + b.currentSpeed, 0) / state.vehicles.length) / MAX_SPEED : 1;
+        const congestion = Math.max(0, 100 - (avgS * 100));
+        document.getElementById('vCongestion').textContent = Math.round(congestion) + "%";
+        const avgWait = state.totalVehiclesProcessed > 0 ? (state.totalWaitAccumulated / state.totalVehiclesProcessed) : 0;
+        document.getElementById('vWait').textContent = avgWait.toFixed(1) + "s";
+    }
+
+    document.getElementById('toggleBtn').onclick = () => { state.running = !state.running; document.getElementById('toggleBtn').textContent = state.running ? "PAUSE SIMULATION" : "RESUME SIMULATION"; };
+    document.getElementById('resetBtn').onclick = () => { state.vehicles = []; state.totalWaitAccumulated = 0; state.totalVehiclesProcessed = 0; state.masterTimer = 0; initIntersections(); };
+    document.getElementById('spawnControl').oninput = (e) => { state.spawnRate = parseFloat(e.target.value); };
+    initIntersections(); draw();
+</script>
+</body>
+</html>
